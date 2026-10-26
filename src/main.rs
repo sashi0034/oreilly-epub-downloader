@@ -10,6 +10,7 @@ mod xml;
 use std::collections::HashMap;
 use std::env::current_dir;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::epub::{create_epub_archive, download_all_files};
 use crate::http_client::build_authenticated_client;
@@ -32,9 +33,18 @@ struct Args {
     /// Do not download files. Use if they were already downloaded in a previous run.
     #[arg(long = "skip-download")]
     skip_download: bool,
+    /// Write the generated EPUB to this path.
+    #[arg(long)]
+    output: Option<PathBuf>,
     /// Number of files to download in parallel. Limit is 8 (be polite).
-    #[arg(long, value_parser=value_parser!(u32).range(1..=8), default_value_t = 4)]
+    #[arg(long, value_parser=value_parser!(u32).range(1..=8), default_value_t = 1)]
     parallel: u32,
+    /// Minimum delay between file requests in milliseconds.
+    #[arg(long, default_value_t = 2500)]
+    request_delay_ms: u64,
+    /// Number of retries for rate limits and temporary server/network errors.
+    #[arg(long, value_parser=value_parser!(u32).range(0..=20), default_value_t = 6)]
+    retry_count: u32,
 }
 
 /// Fetches EPUB structural data (like the chapters URL).
@@ -91,14 +101,21 @@ async fn main() -> Result<()> {
 
     // Obtain the path to the destination EPUB file.
     let user_dirs = UserDirs::new().context("Could not get XDG user directories.")?;
-    let epub_path = user_dirs
-        .download_dir()
-        .unwrap_or(&user_dirs.home_dir().join("Downloads"))
-        .join("oreilly-epub")
-        .join(format!("{}.epub", args.bookid));
+    let fallback_download_dir = user_dirs.home_dir().join("Downloads");
+    let epub_path = args.output.clone().unwrap_or_else(|| {
+        user_dirs
+            .download_dir()
+            .unwrap_or(&fallback_download_dir)
+            .join("oreilly-epub")
+            .join(format!("{}.epub", args.bookid))
+    });
 
     println!("Welcome to SafariBooks Rust Port!");
     println!("Target Book ID: {}", args.bookid);
+    println!(
+        "Download pacing: {} parallel request(s), at least {} ms apart, {} retries",
+        args.parallel, args.request_delay_ms, args.retry_count
+    );
 
     // Initialise the HTTP client.
     println!("Loading cookies and initialising the HTTP client...");
@@ -144,6 +161,8 @@ async fn main() -> Result<()> {
             &file_entries,
             &epub_root,
             args.parallel.try_into()?, // Will work as 1..=8 will fit into any usize.
+            Duration::from_millis(args.request_delay_ms),
+            args.retry_count,
         )
         .await?;
     }

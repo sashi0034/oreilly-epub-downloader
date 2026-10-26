@@ -6,17 +6,21 @@ use crate::{
     models::{Chapter, EpubResponse, FileEntry},
     xml::{build_epub_chapter, write_modified_opf},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use ogrim::xml;
 use relative_path::{RelativePath, RelativePathBuf};
-use reqwest::Client;
+use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use std::{
     collections::HashMap,
     io::{BufReader, Write},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 use tokio::fs::{self, File};
+use tokio::sync::Mutex;
+use tokio::time::{Instant, sleep};
 use tokio_util::io::StreamReader;
 use zip::{CompressionMethod, ZipWriter, write::FileOptions};
 
@@ -37,19 +41,63 @@ fn write_container_xml<W: Write>(out: &mut W, opf_full_path: &RelativePathBuf) -
     Ok(())
 }
 
+/// Spaces request starts across all download workers.
+struct RequestPacer {
+    next_request: Mutex<Instant>,
+    delay: Duration,
+}
+
+impl RequestPacer {
+    fn new(delay: Duration) -> Self {
+        Self {
+            next_request: Mutex::new(Instant::now()),
+            delay,
+        }
+    }
+
+    async fn wait(&self) {
+        let mut next_request = self.next_request.lock().await;
+        let now = Instant::now();
+        if *next_request > now {
+            sleep(*next_request - now).await;
+        }
+        *next_request = Instant::now() + self.delay;
+    }
+}
+
+fn retry_delay(attempt: u32, retry_after: Option<&reqwest::header::HeaderValue>) -> Duration {
+    if let Some(seconds) = retry_after
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_secs(seconds.min(600));
+    }
+
+    Duration::from_secs(15_u64.saturating_mul(1_u64 << attempt.min(4)))
+}
+
 /// Downloads files in parallel to the relative location specified in full_path.
 pub async fn download_all_files(
     client: &Client,
     file_entries: &[FileEntry],
     dest_root: &Path,
     max_concurrent: usize,
+    request_delay: Duration,
+    max_retries: u32,
 ) -> Result<()> {
     let mut downloading = FuturesUnordered::new();
     let mut files_iter = file_entries.iter();
+    let pacer = Arc::new(RequestPacer::new(request_delay));
 
     // Start downloading the first n files.
     for entry in files_iter.by_ref().take(max_concurrent) {
-        downloading.push(download_one_file(client, entry, dest_root));
+        downloading.push(download_one_file(
+            client,
+            entry,
+            dest_root,
+            Arc::clone(&pacer),
+            max_retries,
+        ));
     }
 
     // Obtain completed files from the list as they finish downloading, until empty.
@@ -58,7 +106,13 @@ pub async fn download_all_files(
         result?;
         // Refill the slot (if there are any remaining).
         if let Some(entry) = files_iter.next() {
-            downloading.push(download_one_file(client, entry, dest_root));
+            downloading.push(download_one_file(
+                client,
+                entry,
+                dest_root,
+                Arc::clone(&pacer),
+                max_retries,
+            ));
         }
     }
 
@@ -66,32 +120,101 @@ pub async fn download_all_files(
 }
 
 /// Downloads the given file to the relative location specified in full_path.
-pub async fn download_one_file(
+async fn download_one_file(
     client: &Client,
     file_entry: &FileEntry,
     dest_root: &Path,
+    pacer: Arc<RequestPacer>,
+    max_retries: u32,
 ) -> Result<()> {
     let dest_path = file_entry.full_path.to_path(dest_root);
 
-    // Ensure the directory exists and open the file.
+    // Completed files survive a failed run, so a retry can continue where it stopped.
+    if fs::try_exists(&dest_path).await? {
+        if fs::metadata(&dest_path).await?.len() > 0 {
+            println!("Already downloaded: {}", file_entry.full_path);
+            return Ok(());
+        }
+        // The previous downloader created an empty destination before checking
+        // an HTTP error, so do not mistake a rate-limited file for a completed one.
+        fs::remove_file(&dest_path).await?;
+    }
+
+    // Ensure the directory exists. A .part file is only renamed after a complete response.
     if let Some(parent_dir) = dest_path.parent() {
         fs::create_dir_all(parent_dir).await?;
     }
-    let mut file = File::create(dest_path).await?;
+    let mut part_name = dest_path.as_os_str().to_os_string();
+    part_name.push(".part");
+    let part_path = PathBuf::from(part_name);
 
-    // Obtain the resource as a stream of bytes.
-    let bytes_stream = client
-        .get(file_entry.url.clone())
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes_stream();
-    // Convert the bytes stream are fed to a reader. Must map errors to io errors.
-    let mut reader = StreamReader::new(bytes_stream.map_err(std::io::Error::other));
+    for attempt in 0..=max_retries {
+        pacer.wait().await;
+        let response = match client.get(file_entry.url.clone()).send().await {
+            Ok(response) => response,
+            Err(error) if attempt < max_retries => {
+                let delay = retry_delay(attempt, None);
+                eprintln!(
+                    "Temporary network error for {}: {}. Retrying in {} seconds ({}/{})...",
+                    file_entry.full_path,
+                    error,
+                    delay.as_secs(),
+                    attempt + 1,
+                    max_retries
+                );
+                sleep(delay).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
 
-    // Pipe bytes from the stream to the file.
-    tokio::io::copy(&mut reader, &mut file).await?;
-    Ok(())
+        let status = response.status();
+        let retryable = status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::FORBIDDEN
+            || status.is_server_error();
+        if retryable && attempt < max_retries {
+            let delay = retry_delay(attempt, response.headers().get(RETRY_AFTER));
+            eprintln!(
+                "Server returned {} for {}. Retrying in {} seconds ({}/{})...",
+                status,
+                file_entry.full_path,
+                delay.as_secs(),
+                attempt + 1,
+                max_retries
+            );
+            sleep(delay).await;
+            continue;
+        }
+        let response = response
+            .error_for_status()
+            .with_context(|| format!("Failed to download {}", file_entry.url))?;
+
+        let mut file = File::create(&part_path).await?;
+        let bytes_stream = response.bytes_stream();
+        let mut reader = StreamReader::new(bytes_stream.map_err(std::io::Error::other));
+        match tokio::io::copy(&mut reader, &mut file).await {
+            Ok(_) => {
+                drop(file);
+                fs::rename(&part_path, &dest_path).await?;
+                return Ok(());
+            }
+            Err(error) if attempt < max_retries => {
+                let delay = retry_delay(attempt, None);
+                eprintln!(
+                    "Interrupted download for {}: {}. Retrying in {} seconds ({}/{})...",
+                    file_entry.full_path,
+                    error,
+                    delay.as_secs(),
+                    attempt + 1,
+                    max_retries
+                );
+                sleep(delay).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    Err(anyhow!("Download retries exhausted for {}", file_entry.url))
 }
 
 /// Creates the EPUB archive (creates zip and includes all files in it).

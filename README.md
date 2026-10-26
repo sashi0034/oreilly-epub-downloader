@@ -30,6 +30,8 @@ local `epub_root/`.
 `/api/v2/epubs/.../files/images/foo.jpg`) to **relative paths** inside the
 EPUB so images/styles render correctly.
 - Accelerated file downloads via parallelization.
+- Rate-limit-friendly downloads: serial by default, configurable request pacing,
+  retries with exponential backoff, and continuation from completed files.
 
 ## Installation
 
@@ -69,7 +71,12 @@ Arguments:
 Options:
       --cookies <COOKIES>    Path to the cookies.json file.
       --skip-download        If files already downloaded in a previous run.
-      --parallel <PARALLEL>  Number of files to download in parallel.
+      --output <OUTPUT>      Write the generated EPUB to this path.
+      --parallel <PARALLEL>  Number of files to download in parallel [default: 1].
+      --request-delay-ms <REQUEST_DELAY_MS>
+                             Minimum delay between file requests [default: 2500].
+      --retry-count <RETRY_COUNT>
+                             Retries for rate limits and temporary errors [default: 6].
 ```
 
 **Example:**
@@ -77,6 +84,10 @@ Options:
 ```bash
 oreilly-epub 9781787782204 --cookies ./cookies.json
 ```
+
+The defaults deliberately download slowly. To make a particularly large book
+even gentler on the service, increase `--request-delay-ms`. If a run stops,
+run the same command again; files completed by the previous run are reused.
 
 Requires:
 
@@ -134,7 +145,8 @@ This depends on the platform, as below:
 
 - This tool assumes the O'Reilly “files” API includes OPF/NCX and all
 referenced assets.
-- Concurrency is not enabled yet; downloads are sequential.
+- Downloads are sequential by default; `--parallel` can opt into concurrency
+  while the shared request pacer still spaces request starts.
 
 ## Roadmap / TODO
 
