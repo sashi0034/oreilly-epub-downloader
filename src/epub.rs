@@ -70,7 +70,7 @@ fn retry_delay(attempt: u32, retry_after: Option<&reqwest::header::HeaderValue>)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
     {
-        return Duration::from_secs(seconds.min(600));
+        return Duration::from_secs(seconds.min(1800));
     }
 
     Duration::from_secs(15_u64.saturating_mul(1_u64 << attempt.min(4)))

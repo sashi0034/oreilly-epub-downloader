@@ -43,7 +43,7 @@ struct Args {
     #[arg(long, default_value_t = 2500)]
     request_delay_ms: u64,
     /// Number of retries for rate limits and temporary server/network errors.
-    #[arg(long, value_parser=value_parser!(u32).range(0..=20), default_value_t = 6)]
+    #[arg(long, value_parser=value_parser!(u32).range(0..=20), default_value_t = 7)]
     retry_count: u32,
 }
 
