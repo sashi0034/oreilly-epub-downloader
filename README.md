@@ -33,6 +33,7 @@ EPUB so images/styles render correctly.
 - Rate-limit-friendly downloads: serial by default, randomized request pacing,
   retries with exponential backoff, and continuation from completed files.
 - Per-file progress with a terminal-friendly completion bar.
+- Preview-only access pages are rejected before an EPUB is generated.
 
 ## Installation
 

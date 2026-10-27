@@ -133,6 +133,108 @@ fn print_download_progress(completed: usize, total: usize, outcome: &DownloadOut
     );
 }
 
+fn is_preview_content(contents: &str) -> bool {
+    let identifies_preview = contents.contains("content preview from")
+        || contents.contains("unlock full access")
+        || contents.contains("read now unlock full access");
+    let has_membership_prompt = contents.contains("become an o’reilly member")
+        || contents.contains("become an o'reilly member")
+        || contents.contains("start your free trial");
+    identifies_preview && has_membership_prompt
+}
+
+fn is_truncated_preview_document(contents: &str) -> bool {
+    if !contents.contains("sbo-rt-content") || contents.len() >= 12_000 {
+        return false;
+    }
+    let bytes = contents.as_bytes();
+    let tail = &bytes[bytes.len().saturating_sub(1_024)..];
+    tail.windows(4).any(|window| window == b" ...")
+}
+
+fn reject_preview_content(file_entries: &[FileEntry], epub_root: &Path) -> Result<()> {
+    let mut content_paths = Vec::new();
+    let mut truncated_count = 0;
+    let mut marketing_preview = false;
+
+    for entry in file_entries.iter().filter(|entry| {
+        entry.media_type == "application/xhtml+xml" || entry.media_type == "text/html"
+    }) {
+        let path = entry.full_path.to_path(epub_root);
+        let contents = std::fs::read(&path)
+            .with_context(|| format!("Failed to inspect downloaded content at {path:?}"))?;
+        let contents = String::from_utf8_lossy(&contents).to_lowercase();
+
+        if contents.contains("sbo-rt-content") {
+            content_paths.push(path);
+            if is_truncated_preview_document(&contents) {
+                truncated_count += 1;
+            }
+        }
+        if is_preview_content(&contents) {
+            marketing_preview = true;
+        }
+    }
+
+    let repeatedly_truncated = content_paths.len() >= 5
+        && truncated_count >= 3
+        && truncated_count * 2 >= content_paths.len();
+    if marketing_preview || repeatedly_truncated {
+        // Do not let cached preview chapters survive into a later authenticated run.
+        for path in &content_paths {
+            std::fs::remove_file(path).with_context(|| {
+                format!("Detected preview content but failed to remove {path:?}")
+            })?;
+        }
+        let reason = if repeatedly_truncated {
+            format!(
+                "{} of {} chapter files were truncated",
+                truncated_count,
+                content_paths.len()
+            )
+        } else {
+            "an O'Reilly preview access prompt was found".to_string()
+        };
+        return Err(anyhow!(
+            "Detected O'Reilly preview-only content ({reason}). Cached chapter files were removed; authenticate and run the download again"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_preview_content;
+
+    #[test]
+    fn detects_oreilly_preview_prompt() {
+        let contents =
+            "Content preview from Example. Become an O’Reilly member and unlock full access.";
+        assert!(is_preview_content(&contents.to_lowercase()));
+    }
+
+    #[test]
+    fn does_not_reject_a_book_that_only_mentions_a_free_trial() {
+        let contents = "This product offers a start your free trial button.";
+        assert!(!is_preview_content(contents));
+    }
+
+    #[test]
+    fn detects_a_short_chapter_cut_off_with_three_dots() {
+        let contents = r#"<div id="sbo-rt-content"><p>The chapter starts here ...</p></div>"#;
+        assert!(super::is_truncated_preview_document(contents));
+    }
+
+    #[test]
+    fn does_not_treat_a_long_chapter_as_a_truncated_preview() {
+        let contents = format!(
+            r#"<div id="sbo-rt-content"><p>{} ...</p></div>"#,
+            "complete chapter text ".repeat(1_000)
+        );
+        assert!(!super::is_truncated_preview_document(&contents));
+    }
+}
+
 /// Downloads files in parallel to the relative location specified in full_path.
 pub async fn download_all_files(
     client: &Client,
@@ -290,6 +392,8 @@ pub fn create_epub_archive(
     file_entries: &[FileEntry],
     chapters: &HashMap<String, Chapter>,
 ) -> Result<()> {
+    reject_preview_content(file_entries, epub_root)?;
+
     if let Some(parent_dir) = output_epub.parent() {
         std::fs::create_dir_all(parent_dir)?;
     }
