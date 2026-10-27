@@ -16,7 +16,7 @@ use std::{
     io::{BufReader, Write},
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::fs::{self, File};
 use tokio::sync::Mutex;
@@ -41,27 +41,56 @@ fn write_container_xml<W: Write>(out: &mut W, opf_full_path: &RelativePathBuf) -
     Ok(())
 }
 
-/// Spaces request starts across all download workers.
+const MIN_REQUEST_DELAY_MS: u64 = 1_000;
+const MAX_REQUEST_DELAY_MS: u64 = 2_500;
+const PROGRESS_BAR_WIDTH: usize = 24;
+
+struct DownloadOutcome {
+    full_path: RelativePathBuf,
+    reused: bool,
+}
+
+struct RequestPacerState {
+    next_request: Instant,
+    random_state: u64,
+}
+
+/// Spaces request starts across all download workers using a randomized delay.
 struct RequestPacer {
-    next_request: Mutex<Instant>,
-    delay: Duration,
+    state: Mutex<RequestPacerState>,
 }
 
 impl RequestPacer {
-    fn new(delay: Duration) -> Self {
+    fn new() -> Self {
+        let random_state = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0x9e37_79b9_7f4a_7c15)
+            .max(1);
         Self {
-            next_request: Mutex::new(Instant::now()),
-            delay,
+            state: Mutex::new(RequestPacerState {
+                next_request: Instant::now(),
+                random_state,
+            }),
         }
     }
 
     async fn wait(&self) {
-        let mut next_request = self.next_request.lock().await;
+        let mut state = self.state.lock().await;
         let now = Instant::now();
-        if *next_request > now {
-            sleep(*next_request - now).await;
+        if state.next_request > now {
+            sleep(state.next_request - now).await;
         }
-        *next_request = Instant::now() + self.delay;
+
+        // xorshift64 provides inexpensive jitter without another dependency.
+        let mut value = state.random_state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        state.random_state = value;
+        let range = MAX_REQUEST_DELAY_MS - MIN_REQUEST_DELAY_MS + 1;
+        let delay_ms = MIN_REQUEST_DELAY_MS + value % range;
+        state.next_request = Instant::now() + Duration::from_millis(delay_ms);
     }
 }
 
@@ -76,18 +105,47 @@ fn retry_delay(attempt: u32, retry_after: Option<&reqwest::header::HeaderValue>)
     Duration::from_secs(15_u64.saturating_mul(1_u64 << attempt.min(4)))
 }
 
+fn print_download_progress(completed: usize, total: usize, outcome: &DownloadOutcome) {
+    let filled = if total == 0 {
+        0
+    } else {
+        completed * PROGRESS_BAR_WIDTH / total
+    };
+    let percentage = if total == 0 {
+        100.0
+    } else {
+        completed as f64 * 100.0 / total as f64
+    };
+    let action = if outcome.reused {
+        "Reused"
+    } else {
+        "Downloaded"
+    };
+    println!(
+        "[{}{}] {}/{} ({:5.1}%) {}: {}",
+        "#".repeat(filled),
+        "-".repeat(PROGRESS_BAR_WIDTH - filled),
+        completed,
+        total,
+        percentage,
+        action,
+        outcome.full_path
+    );
+}
+
 /// Downloads files in parallel to the relative location specified in full_path.
 pub async fn download_all_files(
     client: &Client,
     file_entries: &[FileEntry],
     dest_root: &Path,
     max_concurrent: usize,
-    request_delay: Duration,
     max_retries: u32,
 ) -> Result<()> {
     let mut downloading = FuturesUnordered::new();
     let mut files_iter = file_entries.iter();
-    let pacer = Arc::new(RequestPacer::new(request_delay));
+    let pacer = Arc::new(RequestPacer::new());
+    let total = file_entries.len();
+    let mut completed = 0;
 
     // Start downloading the first n files.
     for entry in files_iter.by_ref().take(max_concurrent) {
@@ -103,7 +161,9 @@ pub async fn download_all_files(
     // Obtain completed files from the list as they finish downloading, until empty.
     while let Some(result) = downloading.next().await {
         // Make sure they didn't fail first. Propagate any errors immediately.
-        result?;
+        let outcome = result?;
+        completed += 1;
+        print_download_progress(completed, total, &outcome);
         // Refill the slot (if there are any remaining).
         if let Some(entry) = files_iter.next() {
             downloading.push(download_one_file(
@@ -126,14 +186,16 @@ async fn download_one_file(
     dest_root: &Path,
     pacer: Arc<RequestPacer>,
     max_retries: u32,
-) -> Result<()> {
+) -> Result<DownloadOutcome> {
     let dest_path = file_entry.full_path.to_path(dest_root);
 
     // Completed files survive a failed run, so a retry can continue where it stopped.
     if fs::try_exists(&dest_path).await? {
         if fs::metadata(&dest_path).await?.len() > 0 {
-            println!("Already downloaded: {}", file_entry.full_path);
-            return Ok(());
+            return Ok(DownloadOutcome {
+                full_path: file_entry.full_path.clone(),
+                reused: true,
+            });
         }
         // The previous downloader created an empty destination before checking
         // an HTTP error, so do not mistake a rate-limited file for a completed one.
@@ -196,7 +258,10 @@ async fn download_one_file(
             Ok(_) => {
                 drop(file);
                 fs::rename(&part_path, &dest_path).await?;
-                return Ok(());
+                return Ok(DownloadOutcome {
+                    full_path: file_entry.full_path.clone(),
+                    reused: false,
+                });
             }
             Err(error) if attempt < max_retries => {
                 let delay = retry_delay(attempt, None);

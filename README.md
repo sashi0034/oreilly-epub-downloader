@@ -30,8 +30,9 @@ local `epub_root/`.
 `/api/v2/epubs/.../files/images/foo.jpg`) to **relative paths** inside the
 EPUB so images/styles render correctly.
 - Accelerated file downloads via parallelization.
-- Rate-limit-friendly downloads: serial by default, configurable request pacing,
+- Rate-limit-friendly downloads: serial by default, randomized request pacing,
   retries with exponential backoff, and continuation from completed files.
+- Per-file progress with a terminal-friendly completion bar.
 
 ## Installation
 
@@ -73,8 +74,6 @@ Options:
       --skip-download        If files already downloaded in a previous run.
       --output <OUTPUT>      Write the generated EPUB to this path.
       --parallel <PARALLEL>  Number of files to download in parallel [default: 1].
-      --request-delay-ms <REQUEST_DELAY_MS>
-                             Minimum delay between file requests [default: 2500].
       --retry-count <RETRY_COUNT>
                              Retries for rate limits and temporary errors [default: 7].
 ```
@@ -85,9 +84,9 @@ Options:
 oreilly-epub 9781787782204 --cookies ./cookies.json
 ```
 
-The defaults deliberately download slowly. To make a particularly large book
-even gentler on the service, increase `--request-delay-ms`. If a run stops,
-run the same command again; files completed by the previous run are reused.
+File requests are deliberately spaced by a randomized 1.0 to 2.5 seconds. If a
+run stops, run the same command again; files completed by the previous run are
+reused.
 The default retry schedule makes another attempt after about 15 minutes and
 45 seconds, covering temporary rate-limit blocks of up to roughly 15 minutes.
 

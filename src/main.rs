@@ -10,7 +10,6 @@ mod xml;
 use std::collections::HashMap;
 use std::env::current_dir;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use crate::epub::{create_epub_archive, download_all_files};
 use crate::http_client::build_authenticated_client;
@@ -39,9 +38,6 @@ struct Args {
     /// Number of files to download in parallel. Limit is 8 (be polite).
     #[arg(long, value_parser=value_parser!(u32).range(1..=8), default_value_t = 1)]
     parallel: u32,
-    /// Minimum delay between file requests in milliseconds.
-    #[arg(long, default_value_t = 2500)]
-    request_delay_ms: u64,
     /// Number of retries for rate limits and temporary server/network errors.
     #[arg(long, value_parser=value_parser!(u32).range(0..=20), default_value_t = 7)]
     retry_count: u32,
@@ -113,8 +109,8 @@ async fn main() -> Result<()> {
     println!("Welcome to SafariBooks Rust Port!");
     println!("Target Book ID: {}", args.bookid);
     println!(
-        "Download pacing: {} parallel request(s), at least {} ms apart, {} retries",
-        args.parallel, args.request_delay_ms, args.retry_count
+        "Download pacing: {} parallel request(s), 1000-2500 ms apart, {} retries",
+        args.parallel, args.retry_count
     );
 
     // Initialise the HTTP client.
@@ -155,13 +151,15 @@ async fn main() -> Result<()> {
 
     let epub_root = data_root.join("files").join(&args.bookid);
     if !args.skip_download {
-        println!("Downloading files from the server...");
+        println!(
+            "Downloading {} files from the server...",
+            file_entries.len()
+        );
         download_all_files(
             &client,
             &file_entries,
             &epub_root,
             args.parallel.try_into()?, // Will work as 1..=8 will fit into any usize.
-            Duration::from_millis(args.request_delay_ms),
             args.retry_count,
         )
         .await?;
