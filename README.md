@@ -85,7 +85,7 @@ Options:
 oreilly-epub 9781787782204 --cookies ./cookies.json
 ```
 
-File requests are deliberately spaced by a randomized 1.0 to 2.5 seconds. If a
+File requests are deliberately spaced by a randomized 0.5 to 1.0 seconds. If a
 run stops, run the same command again; files completed by the previous run are
 reused.
 The default retry schedule makes another attempt after about 15 minutes and

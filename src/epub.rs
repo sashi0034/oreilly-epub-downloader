@@ -41,8 +41,8 @@ fn write_container_xml<W: Write>(out: &mut W, opf_full_path: &RelativePathBuf) -
     Ok(())
 }
 
-const MIN_REQUEST_DELAY_MS: u64 = 1_000;
-const MAX_REQUEST_DELAY_MS: u64 = 2_500;
+const MIN_REQUEST_DELAY_MS: u64 = 500;
+const MAX_REQUEST_DELAY_MS: u64 = 1_000;
 const PROGRESS_BAR_WIDTH: usize = 24;
 
 struct DownloadOutcome {

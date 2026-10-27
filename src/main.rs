@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
     println!("Welcome to SafariBooks Rust Port!");
     println!("Target Book ID: {}", args.bookid);
     println!(
-        "Download pacing: {} parallel request(s), 1000-2500 ms apart, {} retries",
+        "Download pacing: {} parallel request(s), 500-1000 ms apart, {} retries",
         args.parallel, args.retry_count
     );
 
