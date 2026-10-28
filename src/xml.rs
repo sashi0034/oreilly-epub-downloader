@@ -7,6 +7,7 @@ use ogrim::{Document, xml};
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::{Reader, Writer};
 use relative_path::{RelativePath, RelativePathBuf};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use url::Url;
@@ -196,10 +197,13 @@ fn rewrite_attributes<'a>(
     for attr in tag_data.attributes() {
         let attr = attr?;
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        // Parsed attributes contain the raw escaped bytes from the source. Decode them
-        // before inserting them into a new element so quick-xml can safely escape the
-        // value for the double-quoted attribute it writes.
-        let value = attr.unescape_value()?.into_owned();
+        // Parsed attributes contain the raw escaped bytes from the source. Some books
+        // also contain bare ampersands in LaTeX alt text, which is invalid XML. Repair
+        // only those ampersands before decoding, then let quick-xml safely escape the
+        // complete value for the double-quoted attribute it writes.
+        let raw_value = String::from_utf8_lossy(attr.value.as_ref());
+        let repaired_value = escape_bare_ampersands(&raw_value);
+        let value = quick_xml::escape::unescape(&repaired_value)?.into_owned();
 
         // Intercept element attributes which could contain links to resources.
         if matches!(
@@ -228,6 +232,53 @@ fn rewrite_attributes<'a>(
     }
 
     Ok(new_elem)
+}
+
+fn escape_bare_ampersands(value: &str) -> Cow<'_, str> {
+    fn starts_with_valid_xml_reference(value: &str) -> bool {
+        if ["amp;", "lt;", "gt;", "apos;", "quot;"]
+            .iter()
+            .any(|entity| value.starts_with(entity))
+        {
+            return true;
+        }
+
+        let Some(numeric) = value.strip_prefix('#') else {
+            return false;
+        };
+        let (digits, radix) = numeric
+            .strip_prefix('x')
+            .or_else(|| numeric.strip_prefix('X'))
+            .map_or((numeric, 10), |hex| (hex, 16));
+        let Some(semicolon) = digits.find(';') else {
+            return false;
+        };
+        semicolon > 0
+            && digits[..semicolon].bytes().all(|byte| match radix {
+                16 => byte.is_ascii_hexdigit(),
+                _ => byte.is_ascii_digit(),
+            })
+    }
+
+    let mut repaired = None;
+    let mut copied_until = 0;
+    for (index, character) in value.char_indices() {
+        if character != '&' || starts_with_valid_xml_reference(&value[index + 1..]) {
+            continue;
+        }
+        let output = repaired.get_or_insert_with(|| String::with_capacity(value.len() + 4));
+        output.push_str(&value[copied_until..index]);
+        output.push_str("&amp;");
+        copied_until = index + 1;
+    }
+
+    match repaired {
+        Some(mut output) => {
+            output.push_str(&value[copied_until..]);
+            Cow::Owned(output)
+        }
+        None => Cow::Borrowed(value),
+    }
 }
 
 #[cfg(test)]
@@ -274,5 +325,38 @@ mod tests {
             alt,
             r#"Figure (<span class="equation"><img src="images/missing.svg" /></span>)"#
         );
+    }
+
+    #[test]
+    fn repairs_bare_ampersands_in_latex_attributes() {
+        let input = r#"<img alt='\begin{align*} &{\boldsymbol x} &amp; y "quoted"' />"#;
+        let mut reader = Reader::from_str(input);
+        let tag = match reader.read_event().unwrap() {
+            Event::Empty(tag) => tag,
+            event => panic!("expected an empty element, got {event:?}"),
+        };
+        let paths: HashMap<&str, &RelativePathBuf> = HashMap::new();
+        let rewritten = rewrite_attributes(&tag, &paths, RelativePath::new("")).unwrap();
+
+        let mut output = Vec::new();
+        Writer::new(&mut output)
+            .write_event(Event::Empty(rewritten))
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains(r#"&amp;{\boldsymbol x} &amp; y &quot;quoted&quot;"#));
+
+        let mut verifier = Reader::from_str(&output);
+        let verified_tag = match verifier.read_event().unwrap() {
+            Event::Empty(tag) => tag,
+            event => panic!("expected an empty element, got {event:?}"),
+        };
+        let alt = verified_tag
+            .try_get_attribute("alt")
+            .unwrap()
+            .unwrap()
+            .unescape_value()
+            .unwrap();
+        assert_eq!(alt, r#"\begin{align*} &{\boldsymbol x} & y "quoted""#);
     }
 }
