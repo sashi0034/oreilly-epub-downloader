@@ -50,6 +50,7 @@ pub fn build_epub_chapter<R: BufRead, W: Write>(
     let wrapper_xhtml = xml!(
         <?xml version="1.0" encoding="UTF-8"?>
         <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"
+            xmlns:mml="http://www.w3.org/1998/Math/MathML"
             lang={epub_data.language} xml:lang={epub_data.language}>
         <head>
             <title>{chapter.title}</title>
