@@ -12,8 +12,9 @@ use ogrim::xml;
 use relative_path::{RelativePath, RelativePathBuf};
 use reqwest::{Client, StatusCode, header::RETRY_AFTER};
 use std::{
+    borrow::Cow,
     collections::HashMap,
-    io::{BufReader, Write},
+    io::{BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -152,6 +153,28 @@ fn is_truncated_preview_document(contents: &str) -> bool {
     tail.windows(4).any(|window| window == b" ...")
 }
 
+fn strip_injected_security_overlay(contents: &str) -> Cow<'_, str> {
+    let overlay = contents
+        .find("id=\"sec-overlay\"")
+        .or_else(|| contents.find("id='sec-overlay'"));
+    let Some(overlay) = overlay else {
+        return Cow::Borrowed(contents);
+    };
+    let Some(nav_end) = contents[..overlay].rfind("</nav>") else {
+        return Cow::Borrowed(contents);
+    };
+    let nav_end = nav_end + "</nav>".len();
+    let Some(body_end) = contents[overlay..].find("</body>") else {
+        return Cow::Borrowed(contents);
+    };
+    let body_end = overlay + body_end;
+
+    let mut cleaned = String::with_capacity(contents.len());
+    cleaned.push_str(&contents[..nav_end]);
+    cleaned.push_str(&contents[body_end..]);
+    Cow::Owned(cleaned)
+}
+
 fn reject_preview_content(file_entries: &[FileEntry], epub_root: &Path) -> Result<()> {
     let mut content_paths = Vec::new();
     let mut truncated_count = 0;
@@ -204,7 +227,8 @@ fn reject_preview_content(file_entries: &[FileEntry], epub_root: &Path) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::is_preview_content;
+    use super::{is_preview_content, strip_injected_security_overlay};
+    use std::borrow::Cow;
 
     #[test]
     fn detects_oreilly_preview_prompt() {
@@ -232,6 +256,26 @@ mod tests {
             "complete chapter text ".repeat(1_000)
         );
         assert!(!super::is_truncated_preview_document(&contents));
+    }
+
+    #[test]
+    fn strips_injected_security_overlay_after_navigation() {
+        let contents = r#"<html><body><nav><a href="chapter.html">Chapter</a></nav><script src="/security.js"></script><link rel="stylesheet" href="/security.css"><script async defer src="/challenge.js"></script><div id="sec-overlay"><div id="sec-container"></div></div><script defer src="/overlay.js"></script></body></html>"#;
+        let cleaned = strip_injected_security_overlay(contents);
+
+        assert_eq!(
+            cleaned,
+            r#"<html><body><nav><a href="chapter.html">Chapter</a></nav></body></html>"#
+        );
+    }
+
+    #[test]
+    fn leaves_normal_navigation_content_unchanged() {
+        let contents = r#"<html><body><nav>Contents</nav><p>Afterword</p></body></html>"#;
+        assert!(matches!(
+            strip_injected_security_overlay(contents),
+            Cow::Borrowed(_)
+        ));
     }
 }
 
@@ -447,6 +491,13 @@ pub fn create_epub_archive(
             )?;
         } else if entry.ourn == opf_entry.ourn {
             write_modified_opf(buf_reader, &mut zip, &epub_data.descriptions.plain)?;
+        } else if matches!(
+            entry.media_type.as_str(),
+            "text/html" | "application/xhtml+xml"
+        ) {
+            let mut contents = String::new();
+            buf_reader.read_to_string(&mut contents)?;
+            zip.write_all(strip_injected_security_overlay(&contents).as_bytes())?;
         } else {
             std::io::copy(&mut buf_reader, &mut zip)?;
         }
