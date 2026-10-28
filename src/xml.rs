@@ -91,7 +91,7 @@ pub fn build_epub_chapter<R: BufRead, W: Write>(
                     &tag_data,
                     url_path_to_local,
                     chapter_dir,
-                )))?;
+                )?))?;
             }
             Ok(Event::Empty(tag_data)) => {
                 // If tags are already empty, leave them as-is.
@@ -99,7 +99,7 @@ pub fn build_epub_chapter<R: BufRead, W: Write>(
                     &tag_data,
                     url_path_to_local,
                     chapter_dir,
-                )))?;
+                )?))?;
             }
             Ok(Event::End(tag_data)) => {
                 // Silently drop closing tags for void elements if they exist (e.g. <img></img>).
@@ -189,16 +189,21 @@ fn rewrite_attributes<'a>(
     tag_data: &BytesStart<'a>,
     url_path_to_local: &HashMap<&str, &RelativePathBuf>,
     chapter_dir: &RelativePath,
-) -> BytesStart<'static> {
+) -> Result<BytesStart<'static>> {
     let name = String::from_utf8_lossy(tag_data.name().as_ref()).into_owned();
     let mut new_elem = BytesStart::new(name);
 
-    for attr in tag_data.attributes().filter_map(Result::ok) {
-        let key = attr.key.as_ref();
+    for attr in tag_data.attributes() {
+        let attr = attr?;
+        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        // Parsed attributes contain the raw escaped bytes from the source. Decode them
+        // before inserting them into a new element so quick-xml can safely escape the
+        // value for the double-quoted attribute it writes.
+        let value = attr.unescape_value()?.into_owned();
 
         // Intercept element attributes which could contain links to resources.
         if matches!(
-            (tag_data.name().as_ref(), key),
+            (tag_data.name().as_ref(), key.as_bytes()),
             (b"img", b"src")
                 | (b"source", b"src")
                 | (b"video", b"src")
@@ -210,19 +215,64 @@ fn rewrite_attributes<'a>(
                 | (b"iframe", b"src")
                 | (b"track", b"src")
         ) {
-            let url = String::from_utf8_lossy(&attr.value);
-
             // If we have a local path, inject it instead of the absolute URL.
-            if let Some(local_path) = url_path_to_local.get(url.as_ref()) {
-                let key = String::from_utf8_lossy(key);
+            if let Some(local_path) = url_path_to_local.get(value.as_str()) {
                 new_elem.push_attribute((key.as_ref(), chapter_dir.relative(local_path).as_str()));
                 continue;
             }
         }
 
-        // Keep all other attributes intact.
-        new_elem.push_attribute(attr);
+        // Re-serialize every value instead of copying the raw attribute. In particular,
+        // this turns quotes nested in a single-quoted source value into &quot;.
+        new_elem.push_attribute((key.as_str(), value.as_str()));
     }
 
-    new_elem
+    Ok(new_elem)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rewrite_attributes;
+    use quick_xml::events::Event;
+    use quick_xml::{Reader, Writer};
+    use relative_path::{RelativePath, RelativePathBuf};
+    use std::collections::HashMap;
+
+    #[test]
+    fn reescapes_quotes_nested_in_single_quoted_attribute() {
+        let input = r#"<img alt='Figure (&lt;span class="equation"&gt;&lt;img src="images/missing.svg" /&gt;&lt;/span&gt;)' src="images/main.png" />"#;
+        let mut reader = Reader::from_str(input);
+        let tag = match reader.read_event().unwrap() {
+            Event::Empty(tag) => tag,
+            event => panic!("expected an empty element, got {event:?}"),
+        };
+        let paths: HashMap<&str, &RelativePathBuf> = HashMap::new();
+        let rewritten = rewrite_attributes(&tag, &paths, RelativePath::new("")).unwrap();
+
+        let mut output = Vec::new();
+        Writer::new(&mut output)
+            .write_event(Event::Empty(rewritten))
+            .unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(output.contains("class=&quot;equation&quot;"));
+        assert!(output.contains("src=&quot;images/missing.svg&quot;"));
+
+        // The rewritten element must remain valid XML and preserve the decoded alt text.
+        let mut verifier = Reader::from_str(&output);
+        let verified_tag = match verifier.read_event().unwrap() {
+            Event::Empty(tag) => tag,
+            event => panic!("expected an empty element, got {event:?}"),
+        };
+        let alt = verified_tag
+            .try_get_attribute("alt")
+            .unwrap()
+            .unwrap()
+            .unescape_value()
+            .unwrap();
+        assert_eq!(
+            alt,
+            r#"Figure (<span class="equation"><img src="images/missing.svg" /></span>)"#
+        );
+    }
 }
